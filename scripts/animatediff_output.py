@@ -1,6 +1,7 @@
 import base64
 import datetime
 from pathlib import Path
+import traceback
 
 import imageio.v3 as imageio
 import numpy as np
@@ -16,21 +17,23 @@ from scripts.animatediff_ui import AnimateDiffProcess
 
 
 class AnimateDiffOutput:
-    api_encode_pil_to_base64_hooked = False
-
-
     def output(self, p: StableDiffusionProcessing, res: Processed, params: AnimateDiffProcess):
         video_paths = []
-        logger.info("Merging images into GIF.")
+        first_frames = []
+        from_xyz = any("xyz_grid" in frame.filename for frame in traceback.extract_stack())
+        logger.info(f"Saving output formats: {', '.join(params.format)}")
         date = datetime.datetime.now().strftime('%Y-%m-%d')
         output_dir = Path(f"{p.outpath_samples}/AnimateDiff/{date}")
         output_dir.mkdir(parents=True, exist_ok=True)
         step = params.video_length if params.video_length > params.batch_size else params.batch_size
         for i in range(res.index_of_first_image, len(res.images), step):
+            if i-res.index_of_first_image >= len(res.all_seeds): break
             # frame interpolation replaces video_list with interpolated frames
             # so make a copy instead of a slice (reference), to avoid modifying res
             frame_list = [image.copy() for image in res.images[i : i + params.video_length]]
-
+            if from_xyz:
+                first_frames.append(res.images[i].copy())
+            
             seq = images.get_next_sequence_number(output_dir, "")
             filename_suffix = f"-{params.request_id}" if params.request_id else ""
             filename = f"{seq:05}-{res.all_seeds[(i-res.index_of_first_image)]}{filename_suffix}"
@@ -41,22 +44,24 @@ class AnimateDiffOutput:
             frame_list = self._interp(p, params, frame_list, filename)
             video_paths += self._save(params, frame_list, video_path_prefix, res, i)
 
-        if len(video_paths) > 0:
-            if p.is_api:
-                if not AnimateDiffOutput.api_encode_pil_to_base64_hooked:
-                    # TODO: remove this hook when WebUI is updated to v1.7.0
-                    logger.info("Hooking api.encode_pil_to_base64 to encode video to base64")
-                    AnimateDiffOutput.api_encode_pil_to_base64_hooked = True
-                    from modules.api import api
-                    api_encode_pil_to_base64 = api.encode_pil_to_base64
-                    def hooked_encode_pil_to_base64(image):
-                        if isinstance(image, str):
-                            return image
-                        return api_encode_pil_to_base64(image)
-                    api.encode_pil_to_base64 = hooked_encode_pil_to_base64
-                res.images = self._encode_video_to_b64(video_paths) + (frame_list if 'Frame' in params.format else [])
-            else:
-                res.images = video_paths
+        if len(video_paths) == 0:
+            return
+
+        res.images = video_paths if not p.is_api else (self._encode_video_to_b64(video_paths) + (frame_list if 'Frame' in params.format else []))
+
+        # replace results with first frame of each video so xyz grid draws correctly
+        if from_xyz:
+            res.images = first_frames
+
+        if shared.opts.data.get("animatediff_frame_extract_remove", False):
+            self._remove_frame_extract(params)
+
+
+    def _remove_frame_extract(self, params: AnimateDiffProcess):
+        if params.video_source and params.video_path and Path(params.video_path).exists():
+            logger.info(f"Removing extracted frames from {params.video_path}")
+            import shutil
+            shutil.rmtree(params.video_path)
 
 
     def _add_reverse(self, params: AnimateDiffProcess, frame_list: list):
@@ -152,7 +157,7 @@ class AnimateDiffOutput:
         infotext = res.infotexts[index]
         s3_enable =shared.opts.data.get("animatediff_s3_enable", False) 
         use_infotext = shared.opts.enable_pnginfo and infotext is not None
-        if "PNG" in params.format and (shared.opts.data.get("animatediff_save_to_custom", False) or getattr(params, "force_save_to_custom", False)):
+        if "PNG" in params.format and (shared.opts.data.get("animatediff_save_to_custom", True) or getattr(params, "force_save_to_custom", False)):
             video_path_prefix.mkdir(exist_ok=True, parents=True)
             for i, frame in enumerate(frame_list):
                 png_filename = video_path_prefix/f"{i:05}.png"
@@ -236,11 +241,28 @@ class AnimateDiffOutput:
                     "install imageio[pyav]",
                     "sd-webui-animatediff MP4 save requirement: imageio[pyav]",
                 )
-            with imageio.imopen(video_path_mp4, 'w', plugin='pyav') as file:
-                if use_infotext:
-                    file.container_metadata["Comment"] = infotext
-                logger.info(f"Saving {video_path_mp4}")
-                file.write(video_array, codec='h264', fps=params.fps)
+                import av
+            options = {
+                "crf": str(shared.opts.data.get("animatediff_mp4_crf", 23))
+            }
+            preset = shared.opts.data.get("animatediff_mp4_preset", "")
+            if preset != "": options["preset"] = preset
+            tune = shared.opts.data.get("animatediff_mp4_tune", "")
+            if tune != "": options["tune"] = tune
+            output = av.open(video_path_mp4, "w")
+            logger.info(f"Saving {video_path_mp4}")
+            if use_infotext:
+                output.metadata["Comment"] = infotext
+            stream = output.add_stream('libx264', params.fps, options=options)
+            stream.width = frame_list[0].width
+            stream.height = frame_list[0].height
+            for img in video_array:
+                frame = av.VideoFrame.from_ndarray(img)
+                packet = stream.encode(frame)
+                output.mux(packet)
+            packet = stream.encode(None)
+            output.mux(packet)
+            output.close()
 
         if "TXT" in params.format and res.images[index].info is not None:
             video_path_txt = str(video_path_prefix) + ".txt"
@@ -307,10 +329,12 @@ class AnimateDiffOutput:
                 videos.append(base64.b64encode(video_file.read()).decode("utf-8"))
         return videos
 
+
     def _install_requirement_if_absent(self,lib):
         import launch
         if not launch.is_installed(lib):
             launch.run_pip(f"install {lib}", f"animatediff requirement: {lib}")
+
 
     def _exist_bucket(self,s3_client,bucketname):
         try:
@@ -321,6 +345,7 @@ class AnimateDiffOutput:
                 return False
             else:
                 raise
+
 
     def _save_to_s3_stroge(self ,file_path):
         """
@@ -356,4 +381,3 @@ class AnimateDiffOutput:
         client.upload_file(file_path, bucket,  targetpath)
         logger.info(f"{file_path} saved to s3 in bucket: {bucket}")
         return f"http://{host}:{port}/{bucket}/{targetpath}"
-        
